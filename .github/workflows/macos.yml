@@ -1,0 +1,12 @@
+name: macOS build and core tests
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/build-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LinguaFloat-prototype
+          path: dist/
