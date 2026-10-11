@@ -175,6 +175,7 @@ private struct SourceBar: View {
                 Button { controller.sourceExpanded.toggle() } label: { Label(controller.sourceExpanded ? "收合原文" : "展開原文", systemImage: "text.alignleft") }
                     .keyboardShortcut("e", modifiers: .command)
                 Toggle(isOn: $controller.following) { Label("跟隨前景視窗", systemImage: "eye") }
+                Toggle(isOn: $controller.petShown) { Label("桌面小幫手", systemImage: "face.smiling") }
                 Divider()
                 Button { controller.openSettings() } label: { Label("設定…", systemImage: "gearshape") }
                     .keyboardShortcut(",", modifiers: .command)
@@ -680,11 +681,12 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("桌面小幫手", isOn: $controller.petShown)
                 Toggle("完成後自動複製結果", isOn: $settings.autoCopy)
             } header: {
                 Text("行為")
             } footer: {
-                Text("自動複製會覆蓋剪貼簿現有內容。").foregroundStyle(.secondary)
+                Text("桌面小幫手是一個可拖曳的小圖示，結果以泡泡顯示在旁邊，不會搶走鍵盤焦點；點小幫手才打開完整面板。關掉後，熱鍵與選取翻譯會直接打開面板。自動複製會覆蓋剪貼簿現有內容。").foregroundStyle(.secondary)
             }
 
             Section {

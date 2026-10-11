@@ -15,6 +15,7 @@ import Combine
     let controller = Controller()
     private var statusItem: NSStatusItem!
     private var followItem: NSMenuItem!
+    private var petItem: NSMenuItem!
     private var hotkeys: [EventHotKeyRef] = []
     private var handler: EventHandlerRef?
     private var subscriptions: Set<AnyCancellable> = []
@@ -30,18 +31,21 @@ import Combine
         menu.addItem(.separator())
         followItem = NSMenuItem(title: "跟隨前景視窗", action: #selector(toggleFollow), keyEquivalent: ""); followItem.target = self
         menu.addItem(followItem)
+        petItem = NSMenuItem(title: "顯示桌面小幫手", action: #selector(togglePet), keyEquivalent: ""); petItem.target = self
+        menu.addItem(petItem)
         menu.addItem(.separator())
         for (title, action, key) in [("設定…", #selector(settings), ","), ("開始使用…", #selector(onboarding), ""), ("結束 LinguaFloat", #selector(quit), "q")] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: key); item.target = self; menu.addItem(item)
         }
         statusItem.menu = menu
         // The icon fills in while an automatic correction is waiting to be looked at; the panel itself never pops up uninvited.
-        controller.$hasSuggestion.combineLatest(controller.$following).receive(on: RunLoop.main).sink { [weak self] suggestion, following in
+        controller.$hasSuggestion.combineLatest(controller.$following, controller.$petShown).receive(on: RunLoop.main).sink { [weak self] suggestion, following, pet in
             let symbol = suggestion ? "character.bubble.fill" : (following ? "text.bubble" : "character.bubble")
             let description = suggestion ? "LinguaFloat：有新結果" : (following ? "LinguaFloat：跟隨模式" : "LinguaFloat")
             self?.statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)
             self?.statusItem.button?.contentTintColor = suggestion ? NSColor(Theme.accent) : nil
             self?.followItem.state = following ? .on : .off
+            self?.petItem.state = pet ? .on : .off
         }.store(in: &subscriptions)
         var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
@@ -84,6 +88,7 @@ import Combine
     @objc func openPanel() { controller.show() }
     @objc func translateClipboard() { controller.mode = .translate; controller.useClipboard() }
     @objc func toggleFollow() { controller.following.toggle() }
+    @objc func togglePet() { controller.petShown.toggle() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         controller.show()
         return true

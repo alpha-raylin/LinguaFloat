@@ -25,9 +25,39 @@ import ApplicationServices
         XCTAssertFalse(delegate.controller.panel.isVisible)
         delegate.controller.panel.close()
     }
+    func testPetModeShowsBubbleNotPanelUntilClicked() async {
+        let service = DelayedModel()
+        let controller = Controller(makeClient: { _, _, _ in service })
+        let previous = controller.settings.showPet
+        controller.settings.showPet = true
+        defer { controller.settings.showPet = previous }
+        controller.setup(); controller.stopPolling()
+        XCTAssertTrue(controller.petShown)
+        XCTAssertTrue(controller.petPanel?.isVisible == true)
+        controller.input = "hello there"
+        controller.run()
+        await service.waitForRequests(1)
+        XCTAssertFalse(controller.panel.isVisible, "a result never opens the panel by itself")
+        XCTAssertTrue(controller.bubbleVisible)
+        XCTAssertFalse(NSApp.isActive, "nothing here may take focus")
+        await service.finish("hello there", text: "你好")
+        await settle { !controller.busy }
+        XCTAssertTrue(controller.bubbleVisible)
+        XCTAssertFalse(controller.panel.isVisible)
+        controller.openFromPet()
+        XCTAssertFalse(controller.bubbleVisible)
+        XCTAssertTrue(controller.panel.isVisible)
+        controller.escape()
+        controller.petShown = false
+        XCTAssertFalse(controller.petPanel?.isVisible == true)
+        controller.panel.close()
+    }
     func testHotkeyCaptureStreamsPartialTextAndOffersSelectionReplace() async {
         let service = DelayedModel()
         let controller = Controller(makeClient: { _, _, _ in service })
+        let previous = controller.settings.showPet
+        controller.settings.showPet = false
+        defer { controller.settings.showPet = previous }
         controller.setup(); controller.stopPolling()
         controller.input = "She go yesterday."
         controller.mode = .correct
@@ -52,6 +82,9 @@ import ApplicationServices
         let service = DelayedModel()
         var languages: [String] = []
         let controller = Controller(makeClient: { _, language, _ in languages.append(language); return service })
+        let previous = controller.settings.showPet
+        controller.settings.showPet = false
+        defer { controller.settings.showPet = previous }
         controller.setup(); controller.stopPolling()
         controller.settings.secondLanguage = "English"
         let element = AXUIElementCreateApplication(123)
@@ -93,11 +126,12 @@ import ApplicationServices
         let after = await service.requestCount
         XCTAssertEqual(after, count)
         XCTAssertEqual(controller.input, "manual draft")
-        controller.invalidate()
-        // A settled selection is user-initiated: it shows the panel.
+        controller.invalidate(); controller.hide()
+        // A settled selection shows the panel, but without taking focus away from where the user is working.
         controller.follow.handler(.selection(TextSnapshot(text: "selected words", element: element, fullValue: nil, pid: 123, editable: false, kind: .selection)))
         await service.waitForRequests(1)
         XCTAssertTrue(controller.panel.isVisible)
+        XCTAssertFalse(controller.panel.isKeyWindow)
         XCTAssertEqual(controller.mode, .translate)
         controller.invalidate()
         controller.panel.close()
@@ -124,6 +158,9 @@ import ApplicationServices
     func testWindowCaptureWaitsForConfirmationAndEscapeHides() async {
         let service = DelayedModel()
         let controller = Controller(makeClient: { _, _, _ in service })
+        let previous = controller.settings.showPet
+        controller.settings.showPet = false
+        defer { controller.settings.showPet = previous }
         controller.setup(); controller.stopPolling()
         controller.pendingWindowCapture = true
         controller.input = "menu menu body"

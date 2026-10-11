@@ -63,6 +63,15 @@ final class FloatingPanel: NSPanel {
     let follow = FollowEngine()
     /// Bumped after the panel becomes key so the editor can claim focus; a request made before that is dropped by AppKit.
     @Published private(set) var editorFocusToken = 0
+    /// The pet's speech bubble is on screen.
+    @Published private(set) var bubbleVisible = false
+    @Published var petShown = false {
+        didSet {
+            guard petShown != oldValue else { return }
+            settings.showPet = petShown
+            if petShown { showPet() } else { hidePet() }
+        }
+    }
     @Published private(set) var partial = ""
     @Published private(set) var startedAt: Date?
     @Published private(set) var lastCorrect: Bool?
@@ -71,7 +80,12 @@ final class FloatingPanel: NSPanel {
     private var generation = UUID()
     private var timer: Timer?
     private var automatic = false
+    /// The request was started by follow mode, so the user is busy elsewhere: never take focus for it.
+    private var fromFollow = false
     var panel: FloatingPanel!
+    var petPanel: PetWindow?
+    var bubblePanel: BubbleWindow?
+    private var bubbleTimer: Timer?
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
     private var anchor: CGRect?
@@ -94,6 +108,12 @@ final class FloatingPanel: NSPanel {
     var targetLanguage: String { mode == .translateSecond ? settings.secondLanguage : settings.language }
     var canSendToHerdr: Bool { Capture.terminals.contains(source?.bundleID ?? "") && FileManager.default.isExecutableFile(atPath: settings.herdr) }
 
+    func log(_ line: @autoclosure () -> String) {
+        guard settings.debugLog else { return }
+        let text = "\(Date()) \(line())\n"
+        if let handle = FileHandle(forWritingAtPath: "/var/tmp/linguafloat.log") { handle.seekToEndOfFile(); handle.write(Data(text.utf8)); handle.closeFile() }
+        else { try? text.write(toFile: "/var/tmp/linguafloat.log", atomically: true, encoding: .utf8) }
+    }
     var showsError: Bool { !busy && output.isEmpty && tone == .error && captureFailure == nil && !pendingWindowCapture }
     var needsSetup: Bool { settings.model.isEmpty || !trusted }
 
@@ -111,6 +131,7 @@ final class FloatingPanel: NSPanel {
         let effect = NSVisualEffectView()
         effect.material = .popover; effect.blendingMode = .behindWindow; effect.state = .active
         effect.wantsLayer = true; effect.layer?.cornerRadius = 12; effect.layer?.cornerCurve = .continuous; effect.layer?.masksToBounds = true
+        effect.autoresizingMask = [.width, .height]
         let hosting = NSHostingView(rootView: MainView(controller: self))
         // The window's size is decided here (placement + fit), never by SwiftUI's intrinsic size pushing through autolayout.
         hosting.sizingOptions = []
@@ -131,6 +152,95 @@ final class FloatingPanel: NSPanel {
             Set((self?.settings.followExcluded ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
         }
         if settings.follow { following = true }
+        if settings.showPet { petShown = true }
+    }
+
+    // MARK: Desktop pet
+
+    private func showPet() {
+        if petPanel == nil {
+            let pet = PetWindow(contentRect: NSRect(origin: .zero, size: CGSize(width: PetLayout.size, height: PetLayout.size)), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            pet.level = .floating; pet.isOpaque = false; pet.backgroundColor = .clear; pet.hasShadow = false
+            pet.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+            pet.hidesOnDeactivate = false; pet.isReleasedWhenClosed = false
+            pet.contentView = FirstMouseHostingView(rootView: PetView(controller: self))
+            pet.onClick = { [weak self] in self?.openFromPet() }
+            pet.onMoved = { [weak self] origin in
+                self?.settings.petOrigin = "\(Int(origin.x)),\(Int(origin.y))"
+                self?.layoutBubble()
+            }
+            let screen = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
+            let saved = settings.petOrigin.split(separator: ",").compactMap { Double($0) }
+            let origin = saved.count == 2 && screen.insetBy(dx: -PetLayout.size, dy: -PetLayout.size).contains(CGPoint(x: saved[0], y: saved[1]))
+                ? CGPoint(x: saved[0], y: saved[1]) : PetLayout.defaultOrigin(in: screen)
+            pet.setFrameOrigin(origin)
+            petPanel = pet
+            let bubble = BubbleWindow(contentRect: NSRect(x: 0, y: 0, width: PetLayout.bubbleWidth, height: 80), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            bubble.level = .floating; bubble.isOpaque = false; bubble.backgroundColor = .clear; bubble.hasShadow = true
+            bubble.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+            bubble.hidesOnDeactivate = false; bubble.isReleasedWhenClosed = false
+            let effect = NSVisualEffectView()
+            effect.material = .popover; effect.blendingMode = .behindWindow; effect.state = .active
+            effect.wantsLayer = true; effect.layer?.cornerRadius = 14; effect.layer?.cornerCurve = .continuous; effect.layer?.masksToBounds = true
+            effect.autoresizingMask = [.width, .height]
+            let hosting = FirstMouseHostingView(rootView: BubbleView(controller: self, settings: settings))
+            hosting.sizingOptions = []
+            hosting.translatesAutoresizingMaskIntoConstraints = false
+            effect.addSubview(hosting)
+            NSLayoutConstraint.activate([
+                hosting.leadingAnchor.constraint(equalTo: effect.leadingAnchor), hosting.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+                hosting.topAnchor.constraint(equalTo: effect.topAnchor), hosting.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
+            ])
+            bubble.contentView = effect
+            bubblePanel = bubble
+        }
+        petPanel?.orderFrontRegardless()
+    }
+    private func hidePet() {
+        hideBubble()
+        petPanel?.orderOut(nil)
+    }
+    /// Puts the current state (working, result, failure, confirmation) in the bubble without touching keyboard focus.
+    func showBubble() {
+        // The bubble is the panel's stand-in; while the panel itself is open it would only repeat it.
+        guard petShown, let bubble = bubblePanel, petPanel != nil, panel?.isVisible != true else { return }
+        layoutBubble()
+        bubble.orderFrontRegardless()
+        bubbleVisible = true
+        bubbleTimer?.invalidate(); bubbleTimer = nil
+        if !busy {
+            bubbleTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in Task { @MainActor in self?.hideBubble() } }
+        }
+    }
+    func hideBubble() {
+        bubbleTimer?.invalidate(); bubbleTimer = nil
+        bubblePanel?.orderOut(nil)
+        bubbleVisible = false
+    }
+    func fitBubble(height: CGFloat) {
+        guard let bubble = bubblePanel, bubble.isVisible, height > 0, abs(bubble.frame.height - ceil(height)) >= 1 else { return }
+        layoutBubble(height: ceil(height))
+    }
+    private func layoutBubble(height: CGFloat? = nil) {
+        guard let pet = petPanel, let bubble = bubblePanel else { return }
+        let screen = screenFor(pet.frame).visibleFrame
+        Self.setFrame(bubble, PetLayout.bubbleFrame(pet: pet.frame, height: height ?? bubble.frame.height, screen: screen))
+    }
+    /// The one deliberate gesture that opens the full panel with keyboard focus.
+    func openFromPet() {
+        hasSuggestion = false
+        hideBubble()
+        pinned = false
+        if source == nil, output.isEmpty { source = SourceInfo(kind: .draft, appName: "", bundleID: "", count: input.count); sourceExpanded = true }
+        anchor = petPanel?.frame
+        present(reposition: true, focus: true)
+    }
+    /// Where a result or a question should surface: the bubble when the pet is on, otherwise the panel.
+    private func surface(focus: Bool) {
+        if petShown { showBubble() }
+        else if focus { present(reposition: !pinned, focus: true) }
+        else if panel?.isVisible == true { /* already showing; state updates in place */ }
+        else { present(reposition: !pinned, focus: false) }
     }
 
     // MARK: Follow mode
@@ -138,23 +248,23 @@ final class FloatingPanel: NSPanel {
     private func handle(_ event: FollowEngine.Event) {
         // Never cancel something the user asked for by hand; follow events only replace other follow results.
         guard !(busy && !automatic) else { return }
-        let visible = panel?.isVisible == true
+        fromFollow = true
         switch event {
         case .selection(let snapshot):
-            guard snapshot.text.count >= 2, snapshot.text != input || output.isEmpty else { return }
+            guard snapshot.text.count >= 2, snapshot.text != input || output.isEmpty else { fromFollow = false; return }
             adopt(snapshot)
             mode = Script.isCJK(snapshot.text) ? .translateSecond : .translate
             process(correct: false)
         case .typing(let snapshot):
-            guard snapshot.text.count >= 4 else { return }
+            guard snapshot.text.count >= 4 else { fromFollow = false; return }
             adopt(snapshot)
             mode = Script.isCJK(snapshot.text) ? .translateSecond : .correct
-            process(correct: mode == .correct, automatic: !visible)
+            process(correct: mode == .correct, automatic: true)
         case .content(let text, let snapshot):
-            guard text.count >= 4, !Script.isCJK(text) else { return }
+            guard text.count >= 4, !Script.isCJK(text) else { fromFollow = false; return }
             adopt(snapshot); target = nil
             mode = .translate
-            process(correct: false, automatic: !visible)
+            process(correct: false, automatic: true)
         }
     }
     /// Drops the finished result into the focused Herdr pane as literal text (no Enter), via the CLI.
@@ -182,30 +292,34 @@ final class FloatingPanel: NSPanel {
         if source == nil { source = SourceInfo(kind: .draft, appName: "", bundleID: "", count: input.count) }
         sourceExpanded = true
         hasSuggestion = false
-        present(reposition: panel?.isVisible == false)
+        hideBubble()
+        present(reposition: panel?.isVisible == false, focus: true)
     }
-    private func present(reposition: Bool) {
+    /// `focus: false` shows the panel without activating the app or taking key status, so typing elsewhere is never interrupted.
+    private func present(reposition: Bool, focus: Bool) {
         guard let panel else { return }
         if reposition {
             if pinned, let workbenchFrame {
-                panel.setFrame(workbenchFrame, display: true)
+                Self.setFrame(panel, workbenchFrame)
             } else {
                 let pointer = NSEvent.mouseLocation
                 let screen = screenFor(anchor ?? CGRect(origin: pointer, size: .zero)).visibleFrame
                 if pinned {
                     // The workbench is a place to work, not a tooltip: centre it rather than hanging it off the pointer.
                     let size = CGSize(width: 480, height: min(600, screen.height - 16))
-                    panel.setFrame(NSRect(x: screen.midX - size.width / 2, y: screen.midY - size.height / 2, width: size.width, height: size.height), display: true)
+                    Self.setFrame(panel, NSRect(x: screen.midX - size.width / 2, y: screen.midY - size.height / 2, width: size.width, height: size.height))
                     edge = .free
                 } else {
                     let size = CGSize(width: Self.quickWidth, height: min(max(panel.frame.height, 200), 400))
                     let placement = Placement.place(size: size, anchor: anchor, pointer: pointer, screen: screen)
                     edge = placement.edge
-                    panel.setFrame(placement.frame, display: true)
+                    Self.setFrame(panel, placement.frame)
                 }
             }
         }
         panel.styleMask = pinned ? [.borderless, .nonactivatingPanel, .fullSizeContentView, .resizable] : [.borderless, .nonactivatingPanel, .fullSizeContentView]
+        log("present reposition=\(reposition) focus=\(focus) pinned=\(pinned) anchor=\(String(describing: anchor)) frame=\(panel.frame) edge=\(edge)")
+        guard focus else { panel.orderFrontRegardless(); return }
         // Take keyboard focus like Spotlight does: activate (no Dock icon, no menu bar for an accessory app) and return it on hide.
         if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != ProcessInfo.processInfo.processIdentifier { previousApp = front }
         NSApp.unhide(nil)
@@ -240,14 +354,21 @@ final class FloatingPanel: NSPanel {
     func togglePin() {
         pinned.toggle()
         if pinned { workbenchFrame = nil; sourceExpanded = sourceExpanded || source?.kind == .draft } else { workbenchFrame = panel?.frame }
-        present(reposition: true)
+        present(reposition: true, focus: true)
     }
     /// Called by the SwiftUI layout when the quick panel's ideal height changes; keeps the edge nearest the text fixed.
     func fit(height: CGFloat) {
         guard let panel, !pinned, height > 0 else { return }
         let screen = screenFor(panel.frame).visibleFrame
         let frame = Placement.resize(panel.frame, to: ceil(height), edge: edge, screen: screen)
-        if abs(frame.height - panel.frame.height) >= 1 || abs(frame.minY - panel.frame.minY) >= 1 { panel.setFrame(frame, display: true) }
+        log("fit height=\(height) edge=\(edge) frame=\(panel.frame) -> \(frame) content=\(panel.contentView?.frame ?? .zero)")
+        if abs(frame.height - panel.frame.height) >= 1 || abs(frame.minY - panel.frame.minY) >= 1 { Self.setFrame(panel, frame) }
+    }
+    /// AppKit leaves a borderless window's content view at a stale size when origin and height change together; pin it to the new frame.
+    static func setFrame(_ window: NSWindow, _ frame: NSRect) {
+        window.setFrame(frame, display: true)
+        window.contentView?.frame = NSRect(origin: .zero, size: frame.size)
+        window.contentView?.layoutSubtreeIfNeeded()
     }
     func escape() {
         if busy { invalidate() } else if pendingWindowCapture { pendingWindowCapture = false; hide() } else { hide() }
@@ -303,15 +424,15 @@ final class FloatingPanel: NSPanel {
             if snapshot.kind == .window {
                 invalidate(nil); pendingWindowCapture = true
                 report("整個視窗的文字較多，確認後才會送出。", .idle)
-                present(reposition: !pinned)
+                surface(focus: true)
             } else {
                 process(correct: correct)
             }
         } catch let failure as CaptureFailure {
             invalidate(nil); captureFailure = failure; source = nil; target = nil; anchor = nil
             report(failure.localizedDescription, .error)
-            present(reposition: !pinned)
-        } catch { invalidate(nil); report(error.localizedDescription, .error); present(reposition: !pinned) }
+            surface(focus: true)
+        } catch { invalidate(nil); report(error.localizedDescription, .error); surface(focus: true) }
     }
     private func adopt(_ snapshot: TextSnapshot) {
         input = snapshot.text; target = snapshot
@@ -321,7 +442,7 @@ final class FloatingPanel: NSPanel {
     func confirmWindowCapture() { guard pendingWindowCapture else { return }; pendingWindowCapture = false; process(correct: mode == .correct) }
     /// Fallback for apps without accessibility text (iTerm2 copies on select, for example). Reads the pasteboard only on this explicit request.
     func useClipboard() {
-        guard let text = Capture.clipboardText() else { captureFailure = nil; report("剪貼簿沒有文字。", .warning); present(reposition: !pinned); return }
+        guard let text = Capture.clipboardText() else { captureFailure = nil; report("剪貼簿沒有文字。", .warning); surface(focus: true); return }
         input = text; target = nil; anchor = nil
         source = SourceInfo(kind: .clipboard, appName: "", bundleID: "", count: text.count)
         captureFailure = nil; pendingWindowCapture = false; sourceExpanded = false
@@ -339,7 +460,7 @@ final class FloatingPanel: NSPanel {
         invalidate(nil); automatic = false; target = nil; anchor = nil; captureFailure = nil; pendingWindowCapture = false; busy = true
         report(ocr ? "請框選螢幕上的文字區域…" : "正在讀取 Herdr 窗格…", .working)
         let id = generation; let path = settings.herdr; let pane = settings.pane
-        if ocr { panel?.orderOut(nil) } else { present(reposition: !pinned) }
+        if ocr { panel?.orderOut(nil); hideBubble() } else { surface(focus: true) }
         task = Task {
             do {
                 let text = try await (ocr ? ExternalCapture.ocr() : ExternalCapture.herdr(path: path, pane: pane))
@@ -347,7 +468,7 @@ final class FloatingPanel: NSPanel {
                 input = text; sourceExpanded = false
                 source = SourceInfo(kind: ocr ? .ocr : .herdr, appName: "", bundleID: "", count: text.count)
                 process(correct: false)
-            } catch { guard id == generation else { return }; busy = false; report(error.localizedDescription, .error); present(reposition: !pinned) }
+            } catch { guard id == generation else { return }; busy = false; report(error.localizedDescription, .error); surface(focus: true) }
         }
     }
     /// Drops any in-flight work. A nil message resets the status line to the idle hint.
@@ -377,7 +498,10 @@ final class FloatingPanel: NSPanel {
         let started = Date()
         lastCorrect = correct; startedAt = started
         busy = true; report(correct ? "校正中…" : "翻譯中…", .working)
-        if !automatic { present(reposition: !pinned) }
+        let followDriven = fromFollow; fromFollow = false
+        if petShown { showBubble() }
+        else if !automatic, !followDriven { present(reposition: !pinned, focus: true) }
+        else if !automatic, panel?.isVisible != true { present(reposition: !pinned, focus: false) }
         task = Task {
             do {
                 let result = try await client.run(source, correct: correct) { text in
@@ -395,7 +519,8 @@ final class FloatingPanel: NSPanel {
                     NSPasteboard.general.clearContents(); NSPasteboard.general.setString(result.text, forType: .string)
                     report("完成，已複製到剪貼簿。", .success)
                 }
-            } catch { guard id == generation else { return }; busy = false; startedAt = nil; partial = ""; report(error.localizedDescription, .error); if !automatic { present(reposition: false) } }
+                if petShown { showBubble() }
+            } catch { guard id == generation else { return }; busy = false; startedAt = nil; partial = ""; report(error.localizedDescription, .error); if petShown { showBubble() } else if !automatic, panel?.isVisible != true { present(reposition: false, focus: false) } }
         }
     }
     func copy() { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(output, forType: .string); report("已複製；請在目標位置貼上。", .success) }

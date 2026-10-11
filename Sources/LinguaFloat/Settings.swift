@@ -18,6 +18,11 @@ final class Settings: ObservableObject {
     @AppStorage("translationModel") var translationModel = ""
     @AppStorage("follow") var follow = false
     @AppStorage("followExcluded") var followExcluded = ""
+    /// Desktop pet: results surface in a speech bubble; the full panel opens only when the pet is clicked.
+    @AppStorage("showPet") var showPet = true
+    @AppStorage("petOrigin") var petOrigin = ""
+    /// Writes presentation geometry to /var/tmp/linguafloat.log; off unless you are debugging layout.
+    @AppStorage("debugLog") var debugLog = false
     @Published var key = KeyStore.read()
     func saveKey() { KeyStore.write(key) }
 }
